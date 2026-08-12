@@ -1,915 +1,559 @@
 import io
 
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 
 
-# -----------------------------------------------------------------------------
-# Fiscal-period helpers
-# -----------------------------------------------------------------------------
+FISCAL_QUARTERS = {
+    10: "Q1", 11: "Q1", 12: "Q1",
+    1: "Q2", 2: "Q2", 3: "Q2",
+    4: "Q3", 5: "Q3", 6: "Q3",
+    7: "Q4", 8: "Q4", 9: "Q4",
+}
 
 
-def _fiscal_year_for_date(date_value):
-    if pd.isna(date_value):
-        return pd.NA
-    return int(date_value.year + 1 if date_value.month >= 10 else date_value.year)
+def _normalize_columns(columns) -> list[str]:
+    return [
+        str(col).strip().lower().replace(" ", "_").replace("/", "_")
+        for col in columns
+    ]
 
 
-def _fy_start_for_number(fiscal_year: int) -> pd.Timestamp:
-    return pd.Timestamp(year=int(fiscal_year) - 1, month=10, day=1)
-
-
-def _add_fiscal_period_columns(
-    dataframe: pd.DataFrame,
-    date_column: str,
+def _build_fiscal_week_calendar(
+    fy_start: pd.Timestamp,
+    report_end: pd.Timestamp,
+    fy_end: pd.Timestamp,
 ) -> pd.DataFrame:
-    """Add FY, fiscal week, fiscal month, and fiscal quarter to an event table."""
-    result = dataframe.copy()
-
-    if result.empty:
-        result["fiscal_year"] = pd.Series(dtype="Int64")
-        result["fiscal_week"] = pd.Series(dtype="Int64")
-        result["week_start"] = pd.Series(dtype="datetime64[ns]")
-        result["week_end"] = pd.Series(dtype="datetime64[ns]")
-        result["week_label"] = pd.Series(dtype="object")
-        result["fiscal_month"] = pd.Series(dtype="Int64")
-        result["month_label"] = pd.Series(dtype="object")
-        result["fiscal_quarter"] = pd.Series(dtype="object")
-        result["quarter_label"] = pd.Series(dtype="object")
-        return result
-
-    dates = pd.to_datetime(result[date_column], errors="coerce").dt.normalize()
-    result[date_column] = dates
-    result["fiscal_year"] = dates.apply(_fiscal_year_for_date).astype("Int64")
-
-    fy_starts = result["fiscal_year"].apply(
-        lambda fy: _fy_start_for_number(int(fy)) if pd.notna(fy) else pd.NaT
+    number_of_weeks = ((report_end - fy_start).days // 7) + 1
+    week_numbers = pd.Series(range(1, number_of_weeks + 1), dtype="int64")
+    week_starts = fy_start + pd.to_timedelta((week_numbers - 1) * 7, unit="D")
+    week_ends = week_starts + pd.Timedelta(days=6)
+    week_ends = week_ends.where(week_ends <= fy_end, fy_end)
+    result = pd.DataFrame(
+        {
+            "Fiscal Week": week_numbers,
+            "Week Start": week_starts,
+            "Week End": week_ends,
+        }
     )
-    days_from_fy_start = (dates - fy_starts).dt.days
-
-    result["fiscal_week"] = (days_from_fy_start // 7 + 1).astype("Int64")
-    result["week_start"] = fy_starts + pd.to_timedelta(
-        (result["fiscal_week"] - 1) * 7,
-        unit="D",
-    )
-    fy_ends = fy_starts + pd.DateOffset(years=1) - pd.Timedelta(days=1)
-    result["week_end"] = result["week_start"] + pd.Timedelta(days=6)
-    result["week_end"] = result["week_end"].where(
-        result["week_end"] <= fy_ends,
-        fy_ends,
-    )
-    result["week_label"] = (
+    result["Week"] = (
         "W"
-        + result["fiscal_week"].astype(str).str.zfill(2)
+        + result["Fiscal Week"].astype(str).str.zfill(2)
         + ": "
-        + result["week_start"].dt.strftime("%m/%d/%y")
+        + result["Week Start"].dt.strftime("%m/%d/%y")
         + " - "
-        + result["week_end"].dt.strftime("%m/%d/%y")
+        + result["Week End"].dt.strftime("%m/%d/%y")
     )
-
-    result["fiscal_month"] = (
-        ((dates.dt.month - 10) % 12) + 1
-    ).astype("Int64")
-    result["month_label"] = (
-        "M"
-        + result["fiscal_month"].astype(str).str.zfill(2)
-        + ": "
-        + dates.dt.strftime("%b %Y")
-    )
-
-    result["quarter_number"] = ((result["fiscal_month"] - 1) // 3 + 1).astype("Int64")
-    result["fiscal_quarter"] = "Q" + result["quarter_number"].astype(str)
-
-    quarter_starts = pd.Series(
-        [
-            fy_start + pd.DateOffset(months=(int(q) - 1) * 3)
-            if pd.notna(fy_start) and pd.notna(q)
-            else pd.NaT
-            for fy_start, q in zip(fy_starts, result["quarter_number"])
-        ],
-        index=result.index,
-        dtype="datetime64[ns]",
-    )
-    quarter_ends = quarter_starts + pd.DateOffset(months=3) - pd.Timedelta(days=1)
-    result["quarter_label"] = (
-        result["fiscal_quarter"]
-        + ": "
-        + quarter_starts.dt.strftime("%b")
-        + "-"
-        + quarter_ends.dt.strftime("%b %Y")
-    )
-
+    result["Complete"] = result["Week End"] <= report_end
     return result
 
 
-def _append_grand_total(summary: pd.DataFrame, label_column: str) -> pd.DataFrame:
-    """Append one Grand Total row, calculating rates/averages rather than summing them."""
-    if summary.empty:
-        return summary.copy()
-
-    result = summary.copy()
-    total_row = {col: "" for col in result.columns}
-    total_row[label_column] = "Grand Total"
-
-    count_columns = [
-        "unique_clients",
-        "requested",
-        "scheduled",
-        "awaiting_scheduling",
-        "invoiced",
-        "awaiting_invoice",
-        "overdue_60_plus",
-    ]
-    for col in count_columns:
-        if col in result.columns:
-            total_row[col] = int(pd.to_numeric(result[col], errors="coerce").fillna(0).sum())
-
-    if "scheduled_rate" in result.columns:
-        denominator = total_row.get("requested", total_row.get("unique_clients", 0))
-        numerator = total_row.get("scheduled", 0)
-        total_row["scheduled_rate"] = numerator / denominator if denominator else 0
-
-    if "invoice_rate" in result.columns:
-        denominator = total_row.get("requested", total_row.get("unique_clients", 0))
-        numerator = total_row.get("invoiced", 0)
-        total_row["invoice_rate"] = numerator / denominator if denominator else 0
-
-    for avg_col in ["avg_days_to_schedule", "avg_days_to_invoice"]:
-        if avg_col in result.columns:
-            total_row[avg_col] = pd.to_numeric(result[avg_col], errors="coerce").mean()
-
-    if "risk_flag" in result.columns:
-        total_row["risk_flag"] = ""
-
-    return pd.concat([result, pd.DataFrame([total_row])], ignore_index=True)
+def _month_calendar(fy_start: pd.Timestamp, report_end: pd.Timestamp) -> pd.DataFrame:
+    starts = pd.date_range(
+        start=fy_start.replace(day=1),
+        end=report_end.replace(day=1),
+        freq="MS",
+    )
+    result = pd.DataFrame({"Month Start": starts})
+    result["Month End"] = result["Month Start"] + pd.offsets.MonthEnd(0)
+    result["Month"] = result["Month Start"].dt.strftime("%b %Y")
+    result["Complete"] = result["Month End"] <= report_end
+    result["Display Month"] = result["Month"]
+    if not result.empty and not bool(result.iloc[-1]["Complete"]):
+        result.loc[result.index[-1], "Display Month"] += " (MTD)"
+    return result
 
 
-def _build_event_table(
-    unique_clients: pd.DataFrame,
-    requested_date_col: str,
-    scheduled_date_col: str,
-    invoice_date_col: str,
-    invoice_available: bool,
+def _add_period_columns(
+    frame: pd.DataFrame,
+    date_col: str,
+    fy_start: pd.Timestamp,
+    fy_end: pd.Timestamp,
 ) -> pd.DataFrame:
-    """Create one operational event row per Requested/Scheduled/Invoiced milestone."""
-    event_frames = []
+    result = frame.copy()
+    if result.empty:
+        for name in ["Fiscal Week", "Week Start", "Week End", "Week", "Month Start", "Month", "Fiscal Quarter"]:
+            result[name] = pd.Series(dtype="object")
+        return result
 
-    requested = unique_clients.loc[
-        unique_clients[requested_date_col].notna(),
-        ["client_key", "clinic", requested_date_col],
+    date = result[date_col].dt.normalize()
+    days = (date - fy_start).dt.days
+    result["Fiscal Week"] = (days // 7 + 1).astype("Int64")
+    result["Week Start"] = fy_start + pd.to_timedelta((result["Fiscal Week"] - 1) * 7, unit="D")
+    result["Week End"] = result["Week Start"] + pd.Timedelta(days=6)
+    result["Week End"] = result["Week End"].where(result["Week End"] <= fy_end, fy_end)
+    result["Week"] = (
+        "W"
+        + result["Fiscal Week"].astype(str).str.zfill(2)
+        + ": "
+        + result["Week Start"].dt.strftime("%m/%d/%y")
+        + " - "
+        + result["Week End"].dt.strftime("%m/%d/%y")
+    )
+    result["Month Start"] = date.dt.to_period("M").dt.to_timestamp()
+    result["Month"] = result["Month Start"].dt.strftime("%b %Y")
+    result["Fiscal Quarter"] = date.dt.month.map(FISCAL_QUARTERS)
+    return result
+
+
+def _add_grand_total_row(table: pd.DataFrame, label_col: str) -> pd.DataFrame:
+    result = table.copy()
+    numeric_cols = [c for c in result.columns if c != label_col]
+    grand = {label_col: "Grand Total"}
+    for col in numeric_cols:
+        grand[col] = int(pd.to_numeric(result[col], errors="coerce").fillna(0).sum())
+    return pd.concat([result, pd.DataFrame([grand])], ignore_index=True)
+
+
+def _metric_records(
+    df: pd.DataFrame,
+    date_col: str,
+    org_col: str,
+    client_key_col: str,
+    fy_start: pd.Timestamp,
+    report_end: pd.Timestamp,
+    selected_orgs: list[str],
+    fy_end: pd.Timestamp,
+) -> pd.DataFrame:
+    scoped = df[
+        df[date_col].notna()
+        & (df[date_col] >= fy_start)
+        & (df[date_col] <= report_end)
+        & df[org_col].isin(selected_orgs)
     ].copy()
-    requested = requested.rename(columns={requested_date_col: "event_date"})
-    requested["stage"] = "Requested"
-    event_frames.append(requested)
-
-    scheduled = unique_clients.loc[
-        unique_clients[scheduled_date_col].notna(),
-        ["client_key", "clinic", scheduled_date_col],
-    ].copy()
-    scheduled = scheduled.rename(columns={scheduled_date_col: "event_date"})
-    scheduled["stage"] = "Scheduled"
-    event_frames.append(scheduled)
-
-    if invoice_available:
-        invoiced = unique_clients.loc[
-            unique_clients[invoice_date_col].notna(),
-            ["client_key", "clinic", invoice_date_col],
-        ].copy()
-        invoiced = invoiced.rename(columns={invoice_date_col: "event_date"})
-        invoiced["stage"] = "Invoiced"
-        event_frames.append(invoiced)
-
-    if not event_frames:
-        return pd.DataFrame(columns=["client_key", "clinic", "event_date", "stage"])
-
-    events = pd.concat(event_frames, ignore_index=True)
-    events = _add_fiscal_period_columns(events, "event_date")
-    return events
+    scoped = scoped.drop_duplicates(subset=[org_col, client_key_col, date_col])
+    scoped = scoped.rename(columns={org_col: "Organization"})
+    return _add_period_columns(scoped, date_col, fy_start, fy_end)
 
 
-def _event_summary(
-    events: pd.DataFrame,
-    period_column: str,
+def _metric_pivot(
+    records: pd.DataFrame,
+    organizations: list[str],
+    period_col: str,
     period_order: list[str],
-    clinics: list[str],
-    invoice_available: bool,
 ) -> pd.DataFrame:
-    """Summarize Requested/Scheduled/Invoiced event volume by period and clinic."""
-    stages = ["Requested", "Scheduled"] + (["Invoiced"] if invoice_available else [])
-
-    if events.empty:
-        index = pd.MultiIndex.from_product(
-            [period_order, clinics],
-            names=[period_column, "clinic"],
-        )
-        pivot = pd.DataFrame(index=index, columns=stages).fillna(0)
+    if records.empty:
+        pivot = pd.DataFrame(0, index=organizations, columns=period_order)
     else:
         pivot = pd.pivot_table(
-            events,
-            index=[period_column, "clinic"],
-            columns="stage",
+            records,
+            index="Organization",
+            columns=period_col,
             values="client_key",
-            aggfunc=pd.Series.nunique,
+            aggfunc="count",
             fill_value=0,
         )
-        pivot = pivot.reindex(columns=stages, fill_value=0)
-        target_index = pd.MultiIndex.from_product(
-            [period_order, clinics],
-            names=[period_column, "clinic"],
-        )
-        pivot = pivot.reindex(target_index, fill_value=0)
-
-    summary = pivot.reset_index()
-    for stage in stages:
-        summary[stage.lower()] = summary[stage].astype(int)
-        summary = summary.drop(columns=[stage])
-
-    # These are stage-event counts, not cohort conversion rates. A Scheduled event
-    # in a period can belong to a request from an earlier period, so no period
-    # "rate" is calculated here (which avoids misleading values above 100%).
-
-    # Add a total row for each reporting period.
-    total_rows = []
-    for period in period_order:
-        period_rows = summary[summary[period_column] == period]
-        row = {period_column: period, "clinic": "Grand Total"}
-        row["requested"] = int(period_rows["requested"].sum())
-        row["scheduled"] = int(period_rows["scheduled"].sum())
-        if invoice_available:
-            row["invoiced"] = int(period_rows["invoiced"].sum())
-        total_rows.append(row)
-
-    if total_rows:
-        summary = pd.concat([summary, pd.DataFrame(total_rows)], ignore_index=True)
-
-    return summary
+        pivot = pivot.reindex(index=organizations, columns=period_order, fill_value=0)
+    pivot = pivot.astype(int)
+    pivot["FYTD Total"] = pivot.sum(axis=1)
+    pivot.index.name = "Organization"
+    return _add_grand_total_row(pivot.reset_index(), "Organization")
 
 
-def _quarter_window(fiscal_year: int, quarter_number: int):
-    fy_start = _fy_start_for_number(fiscal_year)
-    start = fy_start + pd.DateOffset(months=(quarter_number - 1) * 3)
-    end = start + pd.DateOffset(months=3) - pd.Timedelta(days=1)
-    return start.normalize(), end.normalize()
+def _monthly_combined_table(
+    requested: pd.DataFrame,
+    scheduled: pd.DataFrame,
+    organizations: list[str],
+    month_calendar: pd.DataFrame,
+) -> pd.DataFrame:
+    month_order = month_calendar["Month"].tolist()
+    rename = dict(zip(month_calendar["Month"], month_calendar["Display Month"]))
+
+    req = _metric_pivot(requested, organizations, "Month", month_order)
+    sch = _metric_pivot(scheduled, organizations, "Month", month_order)
+    req = req[req["Organization"] != "Grand Total"].set_index("Organization")
+    sch = sch[sch["Organization"] != "Grand Total"].set_index("Organization")
+
+    rows = []
+    for org in organizations:
+        req_row = {"Organization / Metric": f"{org} - Requested"}
+        sch_row = {"Organization / Metric": f"{org} - Scheduled"}
+        for month in month_order:
+            req_row[rename[month]] = int(req.loc[org, month]) if org in req.index else 0
+            sch_row[rename[month]] = int(sch.loc[org, month]) if org in sch.index else 0
+        req_row["FYTD Total"] = int(req.loc[org, "FYTD Total"]) if org in req.index else 0
+        sch_row["FYTD Total"] = int(sch.loc[org, "FYTD Total"]) if org in sch.index else 0
+        rows.extend([req_row, sch_row])
+
+    req_total = {"Organization / Metric": "Grand Total - Requested"}
+    sch_total = {"Organization / Metric": "Grand Total - Scheduled"}
+    for month in month_order:
+        display = rename[month]
+        req_total[display] = int((requested["Month"] == month).sum())
+        sch_total[display] = int((scheduled["Month"] == month).sum())
+    req_total["FYTD Total"] = len(requested)
+    sch_total["FYTD Total"] = len(scheduled)
+    rows.extend([req_total, sch_total])
+    return pd.DataFrame(rows)
 
 
-def _quarter_for_date(date_value: pd.Timestamp, fiscal_year: int) -> int:
-    fy_start = _fy_start_for_number(fiscal_year)
-    month_index = (date_value.year - fy_start.year) * 12 + date_value.month - fy_start.month
-    return int(month_index // 3 + 1)
+def _quarter_tables(
+    requested: pd.DataFrame,
+    scheduled: pd.DataFrame,
+    organizations: list[str],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    quarters = ["Q1", "Q2", "Q3", "Q4"]
+    return (
+        _metric_pivot(requested, organizations, "Fiscal Quarter", quarters),
+        _metric_pivot(scheduled, organizations, "Fiscal Quarter", quarters),
+    )
 
 
-def _format_change(current_value: int, prior_value: int) -> str:
-    difference = current_value - prior_value
-    sign = "+" if difference > 0 else ""
-    if prior_value == 0:
-        if current_value == 0:
-            return "no change (0 vs 0)"
-        return f"{sign}{difference} clients; percentage change not shown because the prior period was 0"
-    pct_change = difference / prior_value
-    return f"{sign}{difference} clients ({pct_change:+.1%})"
+def _weekly_summary(
+    requested: pd.DataFrame,
+    scheduled: pd.DataFrame,
+    week_calendar: pd.DataFrame,
+) -> pd.DataFrame:
+    result = week_calendar[["Fiscal Week", "Week", "Week Start", "Week End", "Complete"]].copy()
+    req_counts = requested.groupby("Fiscal Week").size()
+    sch_counts = scheduled.groupby("Fiscal Week").size()
+    result["Requested"] = result["Fiscal Week"].map(req_counts).fillna(0).astype(int)
+    result["Scheduled"] = result["Fiscal Week"].map(sch_counts).fillna(0).astype(int)
+    return result
 
 
-def _quarter_commentary(
-    events_all: pd.DataFrame,
-    selected_fy: int,
-    report_end: pd.Timestamp,
-    selected_clinics: list[str],
-    invoice_available: bool,
-) -> str:
-    """Create a concise, like-for-like current-quarter workload comment."""
-    fy_start = _fy_start_for_number(selected_fy)
-    fy_end = fy_start + pd.DateOffset(years=1) - pd.Timedelta(days=1)
-    effective_end = min(max(report_end.normalize(), fy_start), fy_end)
-    current_q = _quarter_for_date(effective_end, selected_fy)
-    current_start, natural_end = _quarter_window(selected_fy, current_q)
-    current_end = min(effective_end, natural_end)
-    elapsed_days = (current_end - current_start).days
+def _pct_change(current: int, prior: int) -> str:
+    if prior == 0:
+        return "percentage change is not meaningful because the prior value was zero"
+    return f"{(current - prior) / prior * 100:+.1f}%"
 
-    events = events_all.copy()
-    if selected_clinics:
-        events = events[events["clinic"].isin(selected_clinics)]
 
-    request_events = events[events["stage"] == "Requested"]
-    current = request_events[
-        (request_events["event_date"] >= current_start)
-        & (request_events["event_date"] <= current_end)
-    ]
-    current_total = int(current["client_key"].nunique())
-
-    if current_total:
-        clinic_counts = current.groupby("clinic")["client_key"].nunique().sort_values(ascending=False)
-        top_clinic = clinic_counts.index[0]
-        top_count = int(clinic_counts.iloc[0])
-        top_share = top_count / current_total
-        line1 = (
-            f"**Quarter note:** Q{current_q} has {current_total} RMS requests through "
-            f"{current_end:%b %d}; {top_clinic} has the largest request volume "
-            f"({top_count}, {top_share:.0%} of the total)."
-        )
-    else:
-        line1 = (
-            f"**Quarter note:** No RMS requests are recorded for Q{current_q} through "
-            f"{current_end:%b %d}."
+def _rms_comments(
+    requested: pd.DataFrame,
+    scheduled: pd.DataFrame,
+    organizations: list[str],
+    month_calendar: pd.DataFrame,
+    request_backlog: pd.DataFrame,
+) -> list[str]:
+    comments = []
+    total_req = len(requested)
+    total_sch = len(scheduled)
+    gap = len(request_backlog)
+    if total_req:
+        comments.append(
+            f"FYTD Medical Screening activity includes {total_req} appointment requests and {total_sch} scheduled appointments; "
+            f"{gap} requested client{' remains' if gap == 1 else 's remain'} without a scheduled appointment in the current extract."
         )
 
-    comparisons = []
-    source_min = request_events["event_date"].min() if not request_events.empty else pd.NaT
-    for offset in range(1, 4):
-        prior_q_index = current_q - offset
-        prior_fy = selected_fy
-        while prior_q_index <= 0:
-            prior_q_index += 4
-            prior_fy -= 1
-        prior_start, prior_natural_end = _quarter_window(prior_fy, prior_q_index)
-        prior_end = min(prior_start + pd.Timedelta(days=elapsed_days), prior_natural_end)
-
-        if pd.isna(source_min) or source_min.normalize() > prior_start:
-            continue
-
-        prior = request_events[
-            (request_events["event_date"] >= prior_start)
-            & (request_events["event_date"] <= prior_end)
-        ]
-        prior_total = int(prior["client_key"].nunique())
-        comparisons.append(f"Q{prior_q_index}: {_format_change(current_total, prior_total)}")
-
-    if comparisons:
-        line2 = "Like-for-like request volume vs prior quarters — " + "; ".join(comparisons) + "."
-    else:
-        line2 = (
-            "Comparable earlier quarters are not sufficiently represented in the uploaded file, "
-            "so no quarter-over-quarter percentage is shown."
+    completed = month_calendar[month_calendar["Complete"]]
+    if len(completed) >= 2:
+        current = completed.iloc[-1]
+        prior = completed.iloc[-2]
+        cr = int(((requested["date_appointment_was_requested"] >= current["Month Start"]) & (requested["date_appointment_was_requested"] <= current["Month End"])).sum())
+        pr = int(((requested["date_appointment_was_requested"] >= prior["Month Start"]) & (requested["date_appointment_was_requested"] <= prior["Month End"])).sum())
+        cs = int(((scheduled["date_of_scheduled_appointment_with_clinic"] >= current["Month Start"]) & (scheduled["date_of_scheduled_appointment_with_clinic"] <= current["Month End"])).sum())
+        ps = int(((scheduled["date_of_scheduled_appointment_with_clinic"] >= prior["Month Start"]) & (scheduled["date_of_scheduled_appointment_with_clinic"] <= prior["Month End"])).sum())
+        comments.append(
+            f"From {prior['Month']} to {current['Month']}, requests moved from {pr} to {cr} ({cr-pr:+d}; {_pct_change(cr, pr)}), "
+            f"while scheduled appointments moved from {ps} to {cs} ({cs-ps:+d}; {_pct_change(cs, ps)})."
         )
 
-    if current_end < natural_end:
-        line2 += " The current quarter is partial and comparisons use the same elapsed number of days."
-
-    return line1 + "  \n" + line2
-
-
-# -----------------------------------------------------------------------------
-# Dashboard
-# -----------------------------------------------------------------------------
+    if gap and organizations:
+        backlog_by_org = request_backlog.groupby("Organization").size().sort_values(ascending=False)
+        top_org = backlog_by_org.index[0]
+        comments.append(
+            f"The current unscheduled-request gap is concentrated in {top_org} ({int(backlog_by_org.iloc[0])} client{'s' if int(backlog_by_org.iloc[0]) != 1 else ''}); "
+            "small monthly Medical Screening counts can make percentage changes appear large, so the counts should be read as workflow volume rather than partner quality."
+        )
+    return comments[:3]
 
 
 def render_rms_dashboard():
-    st.header("KSOR RMS Tracker")
+    st.header("KSOR Medical Screening Dashboard")
     st.caption(
-        "Medical Screening request, scheduling, backlog, fiscal-period reporting, and executive exports. "
-        "Fiscal weeks are fixed 7-day periods beginning October 1; Q1=Oct-Dec, Q2=Jan-Mar, "
-        "Q3=Apr-Jun, and Q4=Jul-Sep."
+        "Requested and scheduled Medical Screening activity by organization, fiscal month, quarter and fiscal week. "
+        "Invoice/completion measures appear only when an Invoice Date field is present in the source export."
     )
 
-    uploaded_file = st.file_uploader(
-        "Upload RMS Excel file",
+    st.sidebar.header("RMS inputs")
+    fy_start_input = st.sidebar.date_input(
+        "FY start",
+        value=pd.to_datetime("2025-10-01"),
+        key="rms_fy_start",
+    )
+    fy_start = pd.Timestamp(fy_start_input).normalize()
+    fy_end = fy_start + pd.DateOffset(years=1) - pd.Timedelta(days=1)
+    default_report_end = min(pd.Timestamp.today().normalize(), fy_end)
+    report_end_input = st.sidebar.date_input(
+        "Report through",
+        value=default_report_end,
+        key="rms_report_end",
+    )
+    report_end = pd.Timestamp(report_end_input).normalize()
+    if report_end < fy_start:
+        st.error("Report through date cannot be earlier than the FY start date.")
+        return
+    if report_end > fy_end:
+        st.sidebar.warning(f"Report through was limited to FY end: {fy_end:%m/%d/%Y}.")
+        report_end = fy_end
+
+    uploaded_file = st.sidebar.file_uploader(
+        "Upload Medical Screening Excel file",
         type=["xlsx"],
         key="rms_upload",
     )
-
     if uploaded_file is None:
-        st.info("Upload your KSOR RMS Excel file to begin.")
+        st.info("Upload the ClientTrack Medical Screening export to begin.")
         return
 
     try:
         df = pd.read_excel(uploaded_file)
-    except Exception as exc:
-        st.error(f"Could not read the RMS Excel file: {exc}")
-        return
+        original_columns = list(df.columns)
+        df.columns = _normalize_columns(df.columns)
 
-    df.columns = [
-        col.strip().lower().replace(" ", "_").replace("/", "_")
-        for col in df.columns
-    ]
+        org_col = "organization"
+        client_id_col = "client_id"
+        requested_date_col = "date_appointment_was_requested"
+        scheduled_date_col = "date_of_scheduled_appointment_with_clinic"
+        invoice_date_col = "invoice_date"
+        name_col = "name"
+        dob_col = "birth_date"
+        clinic_col = "clinic_rms_package_was_sent_to"
 
-    client_id_col = "client_id"
-    name_col = "name"
-    dob_col = "birth_date"
-    org_col = "organization"
-    clinic_col = "clinic_rms_package_was_sent_to"
-    requested_date_col = "date_appointment_was_requested"
-    scheduled_date_col = "date_of_scheduled_appointment_with_clinic"
-    invoice_date_col = "invoice_date"
+        required = [org_col, client_id_col, requested_date_col, scheduled_date_col]
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            st.error(f"Missing required columns: {missing}")
+            st.write("Detected columns:", list(df.columns))
+            return
 
-    # Invoice Date is intentionally OPTIONAL because the current ClientTrack export
-    # may omit it. The dashboard still reports Requested/Scheduled activity safely.
-    required_cols = [
-        client_id_col,
-        name_col,
-        dob_col,
-        org_col,
-        requested_date_col,
-        scheduled_date_col,
-    ]
-    missing = [col for col in required_cols if col not in df.columns]
-    if missing:
-        st.error(f"Missing required columns: {missing}")
-        st.write("Detected columns:")
-        st.write(list(df.columns))
-        return
+        for date_col in [requested_date_col, scheduled_date_col, dob_col, invoice_date_col]:
+            if date_col in df.columns:
+                df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
 
-    invoice_available = invoice_date_col in df.columns
-    if not invoice_available:
-        df[invoice_date_col] = pd.NaT
-        st.info(
-            "Invoice Date is not present in this export. Requested and Scheduled reporting remains active; "
-            "invoice-dependent metrics are marked unavailable rather than treated as zero."
+        df[org_col] = df[org_col].astype(str).str.strip()
+        df[client_id_col] = df[client_id_col].astype(str).str.strip()
+        df["client_key"] = df[client_id_col]
+        missing_id = df["client_key"].isin(["", "nan", "None", "<NA>"])
+        if missing_id.any() and name_col in df.columns:
+            fallback_name = df[name_col].astype(str).str.upper().str.strip()
+            if dob_col in df.columns:
+                fallback_name = fallback_name + "_" + df[dob_col].astype(str)
+            df.loc[missing_id, "client_key"] = fallback_name[missing_id]
+
+        if clinic_col in df.columns:
+            df["clinic"] = df[clinic_col].fillna(df[org_col]).astype(str).str.strip()
+        else:
+            df["clinic"] = df[org_col]
+
+        organizations = sorted(
+            df.loc[
+                df[requested_date_col].notna() | df[scheduled_date_col].notna(),
+                org_col,
+            ].dropna().unique()
         )
+        if not organizations:
+            st.error("No valid Medical Screening request or scheduled dates were found.")
+            return
 
-    for col in [dob_col, requested_date_col, scheduled_date_col, invoice_date_col]:
-        df[col] = pd.to_datetime(df[col], errors="coerce")
-
-    if clinic_col in df.columns:
-        df["clinic"] = df[clinic_col].fillna(df[org_col])
-    else:
-        df["clinic"] = df[org_col]
-    df["clinic"] = df["clinic"].astype(str).str.strip()
-
-    df["client_key"] = df[client_id_col].astype(str).str.strip()
-    missing_id = df["client_key"].isin(["", "nan", "None"])
-    df.loc[missing_id, "client_key"] = (
-        df.loc[missing_id, name_col].astype(str).str.upper().str.strip()
-        + "_"
-        + df.loc[missing_id, dob_col].astype(str)
-    )
-
-    # Stable cohort/reporting anchor: request date first, then schedule, then invoice.
-    # This prevents a client's fiscal year from changing simply because a later stage occurs.
-    df["reporting_date"] = df[requested_date_col]
-    df["reporting_date"] = df["reporting_date"].fillna(df[scheduled_date_col])
-    df["reporting_date"] = df["reporting_date"].fillna(df[invoice_date_col])
-    df["fiscal_year"] = df["reporting_date"].apply(_fiscal_year_for_date).astype("Int64")
-
-    df["scheduled"] = df[scheduled_date_col].notna()
-    df["invoiced"] = df[invoice_date_col].notna() if invoice_available else False
-
-    if invoice_available:
-        df["status"] = "Awaiting Scheduling"
-        df.loc[df["scheduled"], "status"] = "Scheduled / Awaiting Invoice"
-        df.loc[df["invoiced"], "status"] = "Invoiced"
-    else:
-        df["status"] = "Awaiting Scheduling"
-        df.loc[df["scheduled"], "status"] = "Scheduled"
-
-    df["days_requested_to_schedule"] = (
-        df[scheduled_date_col] - df[requested_date_col]
-    ).dt.days
-    df["days_requested_to_invoice"] = (
-        df[invoice_date_col] - df[requested_date_col]
-    ).dt.days if invoice_available else pd.NA
-
-    unique_clients = (
-        df.sort_values(by=["client_key", "reporting_date"])
-        .drop_duplicates(subset=["client_key"], keep="last")
-        .copy()
-    )
-
-    today = pd.Timestamp.today().normalize()
-    unique_clients["backlog_start_date"] = pd.NaT
-    awaiting_schedule_mask = ~unique_clients["scheduled"]
-    unique_clients.loc[awaiting_schedule_mask, "backlog_start_date"] = unique_clients.loc[
-        awaiting_schedule_mask, requested_date_col
-    ]
-
-    if invoice_available:
-        awaiting_invoice_mask = unique_clients["scheduled"] & ~unique_clients["invoiced"]
-        unique_clients.loc[awaiting_invoice_mask, "backlog_start_date"] = unique_clients.loc[
-            awaiting_invoice_mask, scheduled_date_col
-        ]
-
-    unique_clients["days_pending"] = (
-        today - unique_clients["backlog_start_date"]
-    ).dt.days
-
-    def backlog_bucket(days):
-        if pd.isna(days):
-            return "No Open Backlog"
-        if days <= 30:
-            return "0-30 days"
-        if days <= 60:
-            return "31-60 days"
-        if days <= 90:
-            return "61-90 days"
-        return "90+ days"
-
-    unique_clients["backlog_age_bucket"] = unique_clients["days_pending"].apply(backlog_bucket)
-    unique_clients["overdue_flag"] = unique_clients["days_pending"].apply(
-        lambda x: "Overdue 60+ days" if pd.notna(x) and x > 60 else "OK"
-    )
-
-    events_all = _build_event_table(
-        unique_clients,
-        requested_date_col,
-        scheduled_date_col,
-        invoice_date_col,
-        invoice_available,
-    )
-
-    st.sidebar.header("RMS Filters")
-    available_fys = sorted(unique_clients["fiscal_year"].dropna().astype(int).unique())
-    if not available_fys:
-        st.error("No valid reporting dates found.")
-        return
-
-    selected_fy = int(
-        st.sidebar.selectbox(
-            "RMS Fiscal Year",
-            available_fys,
-            index=len(available_fys) - 1,
-            key="rms_fiscal_year",
+        selected_orgs = st.sidebar.multiselect(
+            "RMS Organization",
+            organizations,
+            default=organizations,
+            key="rms_organization_filter",
         )
-    )
+        display_orgs = selected_orgs if selected_orgs else organizations
 
-    fy_start = _fy_start_for_number(selected_fy)
-    fy_end = fy_start + pd.DateOffset(years=1) - pd.Timedelta(days=1)
-    default_report_end = min(today, fy_end)
-    report_end_input = st.sidebar.date_input(
-        "Report through",
-        value=default_report_end,
-        min_value=fy_start.date(),
-        max_value=fy_end.date(),
-        key="rms_report_end",
-    )
-    report_end = pd.Timestamp(report_end_input).normalize()
-
-    cohort_fy = unique_clients[
-        (unique_clients["fiscal_year"] == selected_fy)
-        & (unique_clients["reporting_date"] <= report_end)
-    ].copy()
-
-    clinics = sorted(cohort_fy["clinic"].dropna().unique())
-    selected_clinics = st.sidebar.multiselect(
-        "RMS Clinic",
-        clinics,
-        default=clinics,
-        key="rms_clinic_filter",
-    )
-    display_clinics = selected_clinics if selected_clinics else clinics
-
-    status_options = sorted(cohort_fy["status"].dropna().unique())
-    selected_statuses = st.sidebar.multiselect(
-        "RMS Status",
-        status_options,
-        default=status_options,
-        key="rms_status_filter",
-    )
-
-    quarter_options = ["Q1", "Q2", "Q3", "Q4"]
-    selected_quarters = st.sidebar.multiselect(
-        "RMS Fiscal Quarter",
-        quarter_options,
-        default=quarter_options,
-        key="rms_quarter_filter",
-    )
-
-    # Cohort-quarter derives from request/reporting anchor.
-    cohort_fy = _add_fiscal_period_columns(cohort_fy, "reporting_date")
-    filtered = cohort_fy.copy()
-    if selected_clinics:
-        filtered = filtered[filtered["clinic"].isin(selected_clinics)]
-    if selected_statuses:
-        filtered = filtered[filtered["status"].isin(selected_statuses)]
-    if selected_quarters:
-        filtered = filtered[filtered["fiscal_quarter"].isin(selected_quarters)]
-
-    # Stage-event reporting respects FY, report-through date, and clinic filter.
-    events_fy = events_all[
-        (events_all["fiscal_year"] == selected_fy)
-        & (events_all["event_date"] <= report_end)
-    ].copy()
-    if selected_clinics:
-        events_fy = events_fy[events_fy["clinic"].isin(selected_clinics)]
-
-    st.subheader(f"FY{selected_fy} Executive Snapshot")
-
-    total_clients = int(filtered["client_key"].nunique())
-    requested_clients = total_clients
-    scheduled_clients = int(filtered.loc[filtered["scheduled"], "client_key"].nunique())
-    awaiting_scheduling = int(filtered.loc[~filtered["scheduled"], "client_key"].nunique())
-    scheduled_rate = scheduled_clients / requested_clients if requested_clients else 0
-    overdue_clients = int(
-        filtered.loc[filtered["overdue_flag"] == "Overdue 60+ days", "client_key"].nunique()
-    )
-    avg_days_schedule = pd.to_numeric(
-        filtered["days_requested_to_schedule"], errors="coerce"
-    ).mean()
-
-    if invoice_available:
-        invoiced_clients = int(filtered.loc[filtered["invoiced"], "client_key"].nunique())
-        awaiting_invoice = int(
-            filtered.loc[filtered["scheduled"] & ~filtered["invoiced"], "client_key"].nunique()
-        )
-        invoice_rate = invoiced_clients / requested_clients if requested_clients else 0
-        avg_days_invoice = pd.to_numeric(
-            filtered["days_requested_to_invoice"], errors="coerce"
-        ).mean()
-
-        cols = st.columns(8)
-        cols[0].metric("Requested", requested_clients)
-        cols[1].metric("Scheduled", scheduled_clients)
-        cols[2].metric("Awaiting Scheduling", awaiting_scheduling)
-        cols[3].metric("Scheduling Rate", f"{scheduled_rate:.1%}")
-        cols[4].metric("Invoiced", invoiced_clients)
-        cols[5].metric("Awaiting Invoice", awaiting_invoice)
-        cols[6].metric("Invoice Rate", f"{invoice_rate:.1%}")
-        cols[7].metric("Overdue 60+ Days", overdue_clients)
-    else:
-        cols = st.columns(6)
-        cols[0].metric("Requested", requested_clients)
-        cols[1].metric("Scheduled", scheduled_clients)
-        cols[2].metric("Awaiting Scheduling", awaiting_scheduling)
-        cols[3].metric("Scheduling Rate", f"{scheduled_rate:.1%}")
-        cols[4].metric("Overdue 60+ Days", overdue_clients)
-        cols[5].metric(
-            "Avg Days Request→Schedule",
-            "N/A" if pd.isna(avg_days_schedule) else f"{avg_days_schedule:.1f}",
-        )
-
-    st.divider()
-    st.subheader("Clinic Performance Summary")
-
-    clinic_summary = (
-        filtered.groupby("clinic")
-        .agg(
-            unique_clients=("client_key", "nunique"),
-            scheduled=("scheduled", "sum"),
-            overdue_60_plus=(
-                "overdue_flag",
-                lambda x: (x == "Overdue 60+ days").sum(),
-            ),
-            avg_days_to_schedule=("days_requested_to_schedule", "mean"),
-        )
-        .reset_index()
-    )
-    clinic_summary["requested"] = clinic_summary["unique_clients"].astype(int)
-    clinic_summary["scheduled"] = clinic_summary["scheduled"].astype(int)
-    clinic_summary["awaiting_scheduling"] = (
-        clinic_summary["requested"] - clinic_summary["scheduled"]
-    ).astype(int)
-    clinic_summary["scheduled_rate"] = (
-        clinic_summary["scheduled"] / clinic_summary["requested"].replace(0, pd.NA)
-    ).fillna(0)
-
-    if invoice_available:
-        invoice_by_clinic = (
-            filtered.groupby("clinic")
-            .agg(
-                invoiced=("invoiced", "sum"),
-                avg_days_to_invoice=("days_requested_to_invoice", "mean"),
-            )
-            .reset_index()
-        )
-        clinic_summary = clinic_summary.merge(invoice_by_clinic, on="clinic", how="left")
-        clinic_summary["invoiced"] = clinic_summary["invoiced"].fillna(0).astype(int)
-        clinic_summary["awaiting_invoice"] = (
-            clinic_summary["scheduled"] - clinic_summary["invoiced"]
-        ).clip(lower=0).astype(int)
-        clinic_summary["invoice_rate"] = (
-            clinic_summary["invoiced"] / clinic_summary["requested"].replace(0, pd.NA)
-        ).fillna(0)
-
-    # Risk focuses on open backlog. It does not interpret volume as care quality.
-    clinic_summary["risk_flag"] = clinic_summary.apply(
-        lambda row: "Needs Follow-up" if row["overdue_60_plus"] > 0 else "OK",
-        axis=1,
-    )
-
-    desired_order = [
-        "clinic",
-        "requested",
-        "scheduled",
-        "awaiting_scheduling",
-        "scheduled_rate",
-        "avg_days_to_schedule",
-    ]
-    if invoice_available:
-        desired_order += [
-            "invoiced",
-            "awaiting_invoice",
-            "invoice_rate",
-            "avg_days_to_invoice",
-        ]
-    desired_order += ["overdue_60_plus", "risk_flag"]
-    clinic_summary = clinic_summary[[col for col in desired_order if col in clinic_summary.columns]]
-    clinic_summary_display = _append_grand_total(clinic_summary, "clinic")
-    st.dataframe(clinic_summary_display, use_container_width=True, hide_index=True)
-
-    if not clinic_summary.empty:
-        top_row = clinic_summary.sort_values("requested", ascending=False).iloc[0]
-        top_share = top_row["requested"] / requested_clients if requested_clients else 0
-        st.markdown(
-            f"**FYTD note:** {top_row['clinic']} has the largest request volume "
-            f"({int(top_row['requested'])}, {top_share:.0%} of filtered FYTD requests). "
-            "This is a workload-volume indicator, not a quality ranking."
-        )
-
-    st.subheader("Automatic Alerts")
-    alert_df = clinic_summary[clinic_summary["risk_flag"] != "OK"]
-    if alert_df.empty:
-        st.success("No 60+ day open-backlog alerts based on current filters.")
-    else:
-        st.warning("Some clinics have open records older than 60 days and may need follow-up.")
-        st.dataframe(alert_df, use_container_width=True, hide_index=True)
-
-    st.subheader("Backlog Aging Summary")
-    backlog_summary = (
-        filtered[filtered["backlog_start_date"].notna()]
-        .groupby(["clinic", "backlog_age_bucket"])
-        .agg(pending_clients=("client_key", "nunique"))
-        .reset_index()
-    )
-    st.dataframe(backlog_summary, use_container_width=True, hide_index=True)
-
-    if not backlog_summary.empty:
-        backlog_chart = backlog_summary.pivot_table(
-            index="clinic",
-            columns="backlog_age_bucket",
-            values="pending_clients",
-            aggfunc="sum",
-            fill_value=0,
-        )
-        st.bar_chart(backlog_chart)
-
-    st.subheader("Open Backlog Detail")
-    pending_backlog = filtered[filtered["backlog_start_date"].notna()].copy()
-    pending_display_cols = [
-        client_id_col,
-        name_col,
-        "clinic",
-        requested_date_col,
-        scheduled_date_col,
-        invoice_date_col if invoice_available else None,
-        "status",
-        "backlog_start_date",
-        "days_pending",
-        "backlog_age_bucket",
-        "overdue_flag",
-    ]
-    pending_display_cols = [
-        col for col in pending_display_cols if col and col in pending_backlog.columns
-    ]
-    st.dataframe(pending_backlog[pending_display_cols], use_container_width=True, hide_index=True)
-
-    st.subheader("Overdue 60+ Days Detail")
-    overdue_detail = filtered[filtered["overdue_flag"] == "Overdue 60+ days"].copy()
-    st.dataframe(overdue_detail[pending_display_cols], use_container_width=True, hide_index=True)
-
-    # ------------------------------------------------------------------
-    # Fiscal-period summaries
-    # ------------------------------------------------------------------
-    current_week_num = int(((report_end - fy_start).days // 7) + 1)
-    week_numbers = list(range(1, current_week_num + 1))
-    week_order = []
-    for week_num in week_numbers:
-        start = fy_start + pd.Timedelta(days=(week_num - 1) * 7)
-        end = min(start + pd.Timedelta(days=6), fy_end)
-        week_order.append(f"W{week_num:02d}: {start:%m/%d/%y} - {end:%m/%d/%y}")
-
-    month_order = []
-    for month_num in range(1, 13):
-        start = fy_start + pd.DateOffset(months=month_num - 1)
-        if start > report_end:
-            break
-        month_order.append(f"M{month_num:02d}: {start:%b %Y}")
-
-    quarter_order = []
-    for q in range(1, 5):
-        q_start, _ = _quarter_window(selected_fy, q)
-        if q_start <= report_end and (not selected_quarters or f"Q{q}" in selected_quarters):
-            q_end = q_start + pd.DateOffset(months=3) - pd.Timedelta(days=1)
-            quarter_order.append(f"Q{q}: {q_start:%b}-{q_end:%b %Y}")
-
-    st.divider()
-    st.subheader("Weekly Summary")
-    weekly = _event_summary(
-        events_fy,
-        "week_label",
-        week_order,
-        display_clinics,
-        invoice_available,
-    )
-    st.dataframe(weekly, use_container_width=True, hide_index=True)
-
-    st.subheader("Monthly Summary")
-    monthly = _event_summary(
-        events_fy,
-        "month_label",
-        month_order,
-        display_clinics,
-        invoice_available,
-    )
-    st.dataframe(monthly, use_container_width=True, hide_index=True)
-
-    st.subheader("Quarterly Summary")
-    st.caption(
-        "Q1 = Oct-Dec | Q2 = Jan-Mar | Q3 = Apr-Jun | Q4 = Jul-Sep. "
-        "Grand Total rows show total event volume for each quarter."
-    )
-    quarterly = _event_summary(
-        events_fy,
-        "quarter_label",
-        quarter_order,
-        display_clinics,
-        invoice_available,
-    )
-    st.dataframe(quarterly, use_container_width=True, hide_index=True)
-    st.markdown(
-        _quarter_commentary(
-            events_all,
-            selected_fy,
+        requested = _metric_records(
+            df,
+            requested_date_col,
+            org_col,
+            "client_key",
+            fy_start,
             report_end,
-            display_clinics,
-            invoice_available,
+            display_orgs,
+            fy_end,
         )
-    )
+        scheduled = _metric_records(
+            df,
+            scheduled_date_col,
+            org_col,
+            "client_key",
+            fy_start,
+            report_end,
+            display_orgs,
+            fy_end,
+        )
 
-    # ------------------------------------------------------------------
-    # Executive report
-    # ------------------------------------------------------------------
-    st.subheader("Executive Report")
-    top_clinic = (
-        clinic_summary.sort_values("requested", ascending=False)["clinic"].iloc[0]
-        if not clinic_summary.empty
-        else "N/A"
-    )
+        # Requested client backlog is based on requested records with no scheduled date through report_end.
+        requested_keys = set(requested["client_key"].astype(str))
+        scheduled_keys = set(scheduled["client_key"].astype(str))
+        backlog_keys = requested_keys - scheduled_keys
+        request_backlog = requested[requested["client_key"].astype(str).isin(backlog_keys)].copy()
 
-    metric_names = [
-        "Fiscal Year",
-        "Report Through",
-        "Requested",
-        "Scheduled",
-        "Awaiting Scheduling",
-        "Scheduling Rate",
-        "Overdue 60+ Days",
-        "Average Days Request to Schedule",
-        "Highest Request Volume Clinic",
-        "Invoice Data Available",
-    ]
-    metric_values = [
-        f"FY{selected_fy}",
-        report_end.strftime("%m/%d/%Y"),
-        requested_clients,
-        scheduled_clients,
-        awaiting_scheduling,
-        f"{scheduled_rate:.1%}",
-        overdue_clients,
-        "N/A" if pd.isna(avg_days_schedule) else round(avg_days_schedule, 1),
-        top_clinic,
-        "Yes" if invoice_available else "No",
-    ]
+        invoice_available = invoice_date_col in df.columns and df[invoice_date_col].notna().any()
+        invoiced = pd.DataFrame()
+        if invoice_available:
+            invoiced = _metric_records(
+                df,
+                invoice_date_col,
+                org_col,
+                "client_key",
+                fy_start,
+                report_end,
+                display_orgs,
+                fy_end,
+            )
+        else:
+            st.info(
+                "Invoice Date is not present in this export. The dashboard therefore reports Requested and Scheduled activity only; "
+                "it does not infer Invoiced or Completed status."
+            )
 
-    if invoice_available:
-        metric_names[6:6] = ["Invoiced", "Awaiting Invoice", "Invoice Rate", "Average Days Request to Invoice"]
-        metric_values[6:6] = [
-            invoiced_clients,
-            awaiting_invoice,
-            f"{invoice_rate:.1%}",
-            "N/A" if pd.isna(avg_days_invoice) else round(avg_days_invoice, 1),
-        ]
+        total_requested = len(requested)
+        total_scheduled = len(scheduled)
+        total_invoiced = len(invoiced) if invoice_available else None
+        scheduling_rate = total_scheduled / total_requested if total_requested else 0
 
-    executive_report = pd.DataFrame({"metric": metric_names, "value": metric_values})
-    st.dataframe(executive_report, use_container_width=True, hide_index=True)
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("FYTD Requested", total_requested)
+        c2.metric("FYTD Scheduled", total_scheduled)
+        c3.metric("Not Yet Scheduled", len(request_backlog))
+        c4.metric("Scheduling Rate", f"{scheduling_rate:.1%}" if total_requested else "N/A")
+        c5.metric("Organizations", len(display_orgs))
 
-    st.subheader("Visual Dashboard")
-    monthly_totals = monthly[monthly["clinic"] == "Grand Total"].copy()
-    if not monthly_totals.empty:
-        chart_cols = ["requested", "scheduled"] + (["invoiced"] if invoice_available else [])
-        chart_data = monthly_totals.set_index("month_label")[chart_cols]
-        st.markdown("### Monthly RMS Stage Activity")
-        st.line_chart(chart_data)
+        if invoice_available:
+            st.metric("FYTD Invoiced", total_invoiced)
 
-    if not clinic_summary.empty:
-        chart_cols = ["requested", "scheduled"] + (["invoiced"] if invoice_available else [])
-        st.markdown("### RMS Stage Activity by Clinic")
-        st.bar_chart(clinic_summary.set_index("clinic")[chart_cols])
+        req_by_org = requested.groupby("Organization").size().reindex(display_orgs, fill_value=0)
+        sch_by_org = scheduled.groupby("Organization").size().reindex(display_orgs, fill_value=0)
+        summary = pd.DataFrame(
+            {
+                "Organization": display_orgs,
+                "# Appts Requested": req_by_org.values.astype(int),
+                "# Appts Scheduled": sch_by_org.values.astype(int),
+            }
+        )
+        summary["Requested - Scheduled"] = summary["# Appts Requested"] - summary["# Appts Scheduled"]
+        summary = _add_grand_total_row(summary, "Organization")
 
-    if not backlog_summary.empty:
-        st.markdown("### Backlog Aging by Clinic")
-        st.bar_chart(backlog_chart)
+        st.divider()
+        st.subheader(f"FY Medical Screening {fy_start:%m/%d/%y}-{report_end:%m/%d/%y}")
+        st.dataframe(summary, use_container_width=True, hide_index=True)
 
-    # ------------------------------------------------------------------
-    # Export
-    # ------------------------------------------------------------------
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Cleaned_Data")
-        unique_clients.to_excel(writer, index=False, sheet_name="Unique_Clients")
-        filtered.to_excel(writer, index=False, sheet_name="Filtered_View")
-        events_fy.to_excel(writer, index=False, sheet_name="Stage_Events")
-        executive_report.to_excel(writer, index=False, sheet_name="Executive_Report")
-        clinic_summary_display.to_excel(writer, index=False, sheet_name="Clinic_Summary")
-        backlog_summary.to_excel(writer, index=False, sheet_name="Backlog_Summary")
-        pending_backlog.to_excel(writer, index=False, sheet_name="Open_Backlog")
-        overdue_detail.to_excel(writer, index=False, sheet_name="Overdue_60Plus")
-        weekly.to_excel(writer, index=False, sheet_name="Weekly")
-        monthly.to_excel(writer, index=False, sheet_name="Monthly")
-        quarterly.to_excel(writer, index=False, sheet_name="Quarterly")
+        month_calendar = _month_calendar(fy_start, report_end)
+        week_calendar = _build_fiscal_week_calendar(fy_start, report_end, fy_end)
 
-    st.download_button(
-        label="Download RMS Smart Reports Workbook",
-        data=output.getvalue(),
-        file_name="ksor_rms_tracker_smart_reports.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+        requested_quarterly, scheduled_quarterly = _quarter_tables(requested, scheduled, display_orgs)
+        st.subheader("Medical Screening - Quarterly Totals")
+        st.markdown("**Appointments Requested**")
+        st.dataframe(requested_quarterly, use_container_width=True, hide_index=True)
+        st.markdown("**Appointments Scheduled**")
+        st.dataframe(scheduled_quarterly, use_container_width=True, hide_index=True)
+
+        current_q = FISCAL_QUARTERS[report_end.month]
+        quarter_end_month = {"Q1": 12, "Q2": 3, "Q3": 6, "Q4": 9}[current_q]
+        quarter_end_year = fy_start.year if current_q == "Q1" else fy_start.year + 1
+        quarter_end = pd.Timestamp(quarter_end_year, quarter_end_month, 1) + pd.offsets.MonthEnd(0)
+        if report_end < quarter_end:
+            st.caption(f"{current_q} is partial through {report_end:%m/%d/%Y}; quarter-over-quarter narrative comparison is deferred until the quarter closes.")
+
+        monthly = _monthly_combined_table(requested, scheduled, display_orgs, month_calendar)
+        st.subheader("Medical Screening - Monthly Totals")
+        st.dataframe(monthly, use_container_width=True, hide_index=True)
+
+        monthly_trend = month_calendar[["Month", "Display Month", "Complete"]].copy()
+        monthly_trend["Requested"] = monthly_trend["Month"].map(requested.groupby("Month").size()).fillna(0).astype(int)
+        monthly_trend["Scheduled"] = monthly_trend["Month"].map(scheduled.groupby("Month").size()).fillna(0).astype(int)
+        trend_long = monthly_trend.melt(
+            id_vars=["Month", "Display Month", "Complete"],
+            value_vars=["Requested", "Scheduled"],
+            var_name="Metric",
+            value_name="Count",
+        )
+        fig = px.line(
+            trend_long,
+            x="Display Month",
+            y="Count",
+            color="Metric",
+            markers=True,
+            title="Monthly Medical Screening Activity",
+        )
+        fig.update_layout(xaxis_title="", yaxis_title="Appointments", xaxis_tickangle=-45)
+        st.plotly_chart(fig, use_container_width=True)
+
+        comments = _rms_comments(requested, scheduled, display_orgs, month_calendar, request_backlog)
+        if comments:
+            st.markdown("#### Medical Screening observations")
+            for comment in comments:
+                st.markdown(f"- {comment}")
+
+        st.divider()
+        with st.expander("Fiscal-week summary"):
+            weekly = _weekly_summary(requested, scheduled, week_calendar)
+            st.dataframe(weekly, use_container_width=True, hide_index=True)
+            completed_weekly = weekly[weekly["Complete"]]
+            if not completed_weekly.empty:
+                weekly_long = completed_weekly.melt(
+                    id_vars=["Fiscal Week", "Week"],
+                    value_vars=["Requested", "Scheduled"],
+                    var_name="Metric",
+                    value_name="Count",
+                )
+                weekly_fig = px.line(weekly_long, x="Week", y="Count", color="Metric", markers=True)
+                weekly_fig.update_layout(xaxis_title="Fiscal Week", yaxis_title="Appointments", xaxis_tickangle=-45)
+                st.plotly_chart(weekly_fig, use_container_width=True)
+
+        if invoice_available:
+            with st.expander("Invoice-based measures (available in this source export)"):
+                invoice_scope = df[
+                    df[invoice_date_col].notna()
+                    & df[org_col].isin(display_orgs)
+                    & (df[invoice_date_col] >= fy_start)
+                    & (df[invoice_date_col] <= report_end)
+                ].copy()
+                invoice_scope["days_request_to_invoice"] = (
+                    invoice_scope[invoice_date_col] - invoice_scope[requested_date_col]
+                ).dt.days
+                avg_days = invoice_scope["days_request_to_invoice"].mean()
+                st.metric("Average Days Request to Invoice", "N/A" if pd.isna(avg_days) else f"{avg_days:.1f}")
+                invoice_by_org = invoice_scope.groupby(org_col).size().rename("Invoiced").reset_index()
+                st.dataframe(invoice_by_org, use_container_width=True, hide_index=True)
+
+        with st.expander("Unscheduled requests and source detail"):
+            if request_backlog.empty:
+                st.success("No FYTD requested clients are currently missing a scheduled appointment in the selected extract.")
+            else:
+                backlog_cols = [
+                    c for c in [
+                        "Organization", "client_id", "name", requested_date_col,
+                        scheduled_date_col, "clinic", "client_key",
+                    ] if c in request_backlog.columns
+                ]
+                st.markdown("**Requested but not yet scheduled**")
+                st.dataframe(request_backlog[backlog_cols], use_container_width=True, hide_index=True)
+            st.markdown("**Cleaned Source Data**")
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
+        weekly_export = _weekly_summary(requested, scheduled, week_calendar)
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            summary.to_excel(writer, index=False, sheet_name="FYTD Summary")
+            requested_quarterly.to_excel(writer, index=False, sheet_name="Quarterly Requested")
+            scheduled_quarterly.to_excel(writer, index=False, sheet_name="Quarterly Scheduled")
+            monthly.to_excel(writer, index=False, sheet_name="Monthly Totals")
+            monthly_trend.to_excel(writer, index=False, sheet_name="Monthly Trend")
+            weekly_export.to_excel(writer, index=False, sheet_name="Weekly Summary")
+            week_calendar.to_excel(writer, index=False, sheet_name="Fiscal Week Calendar")
+            month_calendar.to_excel(writer, index=False, sheet_name="Fiscal Month Calendar")
+            request_backlog.to_excel(writer, index=False, sheet_name="Unscheduled Requests")
+            requested.to_excel(writer, index=False, sheet_name="Requested Detail")
+            scheduled.to_excel(writer, index=False, sheet_name="Scheduled Detail")
+            if invoice_available:
+                invoiced.to_excel(writer, index=False, sheet_name="Invoiced Detail")
+            df.to_excel(writer, index=False, sheet_name="Cleaned Source")
+
+        st.download_button(
+            label="Download Medical Screening Executive Workbook",
+            data=output.getvalue(),
+            file_name="ksor_medical_screening_dashboard.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+    except Exception as exc:
+        st.exception(exc)
+        st.error(f"Could not build Medical Screening dashboard: {exc}")
 
 
 def main():
